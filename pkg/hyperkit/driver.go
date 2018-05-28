@@ -25,19 +25,21 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"regexp"
+
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/log"
+	"github.com/docker/machine/libmachine/mcnutils"
 	"github.com/docker/machine/libmachine/state"
 	nfsexports "github.com/johanneswuerbach/nfsexports"
+	pkgdrivers "github.com/machine-drivers/docker-machine-driver-hyperkit/pkg/drivers"
 	hyperkit "github.com/moby/hyperkit/go"
 	"github.com/pkg/errors"
-	pkgdrivers "github.com/machine-drivers/docker-machine-driver-hyperkit/pkg/drivers"
-	"regexp"
-	"github.com/docker/machine/libmachine/mcnutils"
 )
 
 const (
@@ -66,10 +68,12 @@ type Driver struct {
 	NFSShares      []string
 	NFSSharesRoot  string
 	UUID           string
-	BootKernel string
-	BootInitrd string
-	Initrd     string
-	Vmlinuz    string
+	BootKernel     string
+	BootInitrd     string
+	Initrd         string
+	Vmlinuz        string
+	VpnKitSock     string
+	VSockPorts     []string
 }
 
 func NewDriver(hostName, storePath string) *Driver {
@@ -103,7 +107,7 @@ func (d *Driver) Create() error {
 
 	isoPath := d.ResolveStorePath(isoFilename)
 	if err := d.extractKernel(isoPath); err != nil {
-		return err
+		return errors.Wrap(err, "extracting kernel")
 	}
 
 	return d.Start()
@@ -175,14 +179,14 @@ func (d *Driver) Restart() error {
 
 // Start a host
 func (d *Driver) Start() error {
-	h, err := hyperkit.New("", "", filepath.Join(d.StorePath, "machines", d.MachineName))
+	h, err := hyperkit.New("", d.VpnKitSock, filepath.Join(d.StorePath, "machines", d.MachineName))
 	if err != nil {
-		return err
+		return errors.Wrap(err, "new-ing Hyperkit")
 	}
 
 	// TODO: handle the rest of our settings.
 	h.Kernel = d.ResolveStorePath(d.Vmlinuz)
-	h.Initrd =d.ResolveStorePath(d.Initrd)
+	h.Initrd = d.ResolveStorePath(d.Initrd)
 	h.VMNet = true
 	h.ISOImages = []string{d.ResolveStorePath(isoFilename)}
 	h.Console = hyperkit.ConsoleFile
@@ -190,10 +194,17 @@ func (d *Driver) Start() error {
 	h.Memory = d.Memory
 	h.UUID = d.UUID
 
+	if vsockPorts, err := d.extractVSockPorts(); err != nil {
+		return err
+	} else if len(vsockPorts) >= 1 {
+		h.VSock = true
+		h.VSockPorts = vsockPorts
+	}
+
 	log.Infof("Using UUID %s", h.UUID)
 	mac, err := GetMACAddressFromUUID(h.UUID)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "getting MAC address from UUID")
 	}
 
 	// Need to strip 0's
@@ -208,7 +219,7 @@ func (d *Driver) Start() error {
 	}
 	log.Infof("Starting with cmdline: %s", d.Cmdline)
 	if err := h.Start(d.Cmdline); err != nil {
-		return err
+		return errors.Wrapf(err, "starting with cmd line: %s", d.Cmdline)
 	}
 
 	getIP := func() error {
@@ -275,11 +286,11 @@ func (d *Driver) extractKernel(isoPath string) error {
 			return nil
 		})
 	}
-	
-	if  d.BootKernel == "" || d.BootInitrd == "" {
+
+	if d.BootKernel == "" || d.BootInitrd == "" {
 		err := fmt.Errorf("==== Can't extract Kernel and Ramdisk file ====")
 		return err
-		}
+	}
 
 	dest := d.ResolveStorePath(d.Vmlinuz)
 	log.Debugf("Extracting %s into %s", d.BootKernel, dest)
@@ -294,6 +305,31 @@ func (d *Driver) extractKernel(isoPath string) error {
 	}
 
 	return nil
+}
+
+// InvalidPortNumberError implements the Error interface.
+// It is used when a VSockPorts port number cannot be recognised as an integer.
+type InvalidPortNumberError string
+
+// Error returns an Error for InvalidPortNumberError
+func (port InvalidPortNumberError) Error() string {
+	return fmt.Sprintf("vsock port '%s' is not an integer", string(port))
+}
+
+func (d *Driver) extractVSockPorts() ([]int, error) {
+	vsockPorts := make([]int, 0, len(d.VSockPorts))
+
+	for _, port := range d.VSockPorts {
+		p, err := strconv.Atoi(port)
+		if err != nil {
+			var err InvalidPortNumberError
+			err = InvalidPortNumberError(port)
+			return nil, err
+		}
+		vsockPorts = append(vsockPorts, p)
+	}
+
+	return vsockPorts, nil
 }
 
 func (d *Driver) setupNFSShare() error {

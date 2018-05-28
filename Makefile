@@ -7,6 +7,10 @@ REPOPATH ?= $(ORG)/docker-machine-driver-hyperkit
 vendor:
 	dep ensure -v
 
+.PHONY: test
+test: vendor
+	go test -cover -race -parallel 2 ./...
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
